@@ -1,29 +1,28 @@
-from sympy.printing.pytorch import torch
+import torch
 from ultralytics import YOLO
-import cv2
-
 
 class YOLORecognizer:
     def __init__(self, weights_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        """Загрузка YOLO модели из .pt файла"""
+        """Инициализация модели происходит ОДИН раз при запуске программы"""
         self.model = YOLO(weights_path)
         self.device = device
         self.model.to(device)
-        print(f"Модель YOLO загружена на устройство: {self.device}")
 
-    def predict(self, image_path, conf_threshold=0.25):
+    def process_frame(self, frame, conf_threshold=0.85):
         """
-        Распознавание объектов на изображении
-
-        Returns:
-            список обнаруженных объектов с координатами, классами и уверенностью
+        Принимает кадр из памяти (OpenCV bgr matrix) и возвращает размеченный кадр
         """
-        results = self.model(image_path, conf=conf_threshold, device=self.device)
-        return results[0]  # Первое изображение в батче
+        # Передаем frame (массив numpy) напрямую в YOLO вместо пути к файлу
+        results = self.model(frame, conf=conf_threshold, device=self.device, verbose=False)
 
-    def predict_with_details(self, image_path, conf_threshold=0.25):
-        """Получение детальной информации об объектах"""
-        result = self.predict(image_path, conf_threshold)
+        # Получаем отрисованный кадр с рамками YOLO прямо в памяти
+        annotated_frame = results[0].plot()
+
+        return annotated_frame
+
+    def get_details(self, frame, conf_threshold=0.85):
+        results = self.model(frame, conf=conf_threshold, device=self.device, verbose=False)
+        result = results[0]
 
         objects = []
         if result.boxes is not None:
@@ -31,41 +30,13 @@ class YOLORecognizer:
                 objects.append({
                     'class': int(box.cls[0]),
                     'confidence': float(box.conf[0]),
-                    'bbox': box.xyxy[0].tolist()  # [x1, y1, x2, y2]
+                    'bbox': box.xyxy[0].tolist()
                 })
-
-        return {
-            'image_path': image_path,
-            'objects': objects,
-            'num_objects': len(objects),
-            'names': self.model.names
-        }
-
-    def visualize(self, image_path, conf_threshold=0.25, save_path='result.jpg'):
-        """Визуализация результатов на изображении"""
-        results = self.model(image_path, conf=conf_threshold, device=self.device)
-        annotated = results[0].plot()
-        cv2.imwrite(save_path, annotated)
-        print(f"Результат сохранён в {save_path}")
-        return annotated
+        return objects
 
 
-# Использование
-def main():
-    WEIGHTS_PATH = "runs/detect/train-12/weights/best.pt"  # Ваш путь
-    IMAGE_PATH = "arrow_dataset/frame (1).jpg"
-
-    recognizer = YOLORecognizer(weights_path=WEIGHTS_PATH)
-    result = recognizer.predict_with_details(IMAGE_PATH)
-
-    print(f"Найдено объектов: {result['num_objects']}")
-    for obj in result['objects']:
-        class_name = result['names'][obj['class']]
-        print(f"  - {class_name}: уверенность {obj['confidence']:.2f}")
-
-    # Визуализация
-    recognizer.visualize(IMAGE_PATH, save_path='output.jpg')
+recognizer = YOLORecognizer(weights_path="train-12/weights/best.pt")
 
 
-if __name__ == "__main__":
-    main()
+def process_frame(frame):
+    return recognizer.process_frame(frame)
