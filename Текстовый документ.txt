@@ -1,120 +1,190 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from ultralytics import YOLO
 import cv2
-import torch
 import numpy as np
 from pioneer_sdk import Pioneer, Camera
 import time
 from datetime import datetime
-import signal
-import sys
 import os
+import requests
 
-class DroneYOLORecognizer:
-    def __init__(self, weights_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
+class YOLOONNXRecognizer:
+    """YOLO распознаватель без PyTorch, используя ONNX Runtime"""
+    
+    def __init__(self, onnx_path, confidence_threshold=0.5, nms_threshold=0.45):
         """
-        Инициализация распознавателя для дрона
-        """
-        # Загрузка модели YOLO
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"Файл весов не найден: {weights_path}")
+        Инициализация с ONNX моделью
         
-        self.model = YOLO(weights_path)
-        self.device = device
-        self.model.to(device)
-        print(f"✅ Модель YOLO загружена на устройство: {self.device}")
-
-        # Цвета для разных классов (BGR формат для OpenCV)
+        Args:
+            onnx_path: путь к .onnx файлу
+            confidence_threshold: порог уверенности
+            nms_threshold: порог NMS
+        """
+        # Проверка наличия onnxruntime
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise ImportError("Установите onnxruntime: pip install onnxruntime")
+        
+        # Определение провайдера (CPU/GPU)
+        available_providers = ort.get_available_providers()
+        print(f"📊 Доступные провайдеры: {available_providers}")
+        
+        # Выбор лучшего провайдера
+        if 'CUDAExecutionProvider' in available_providers:
+            self.provider = 'CUDAExecutionProvider'
+            print("✅ Используется NVIDIA GPU")
+        elif 'ROCMExecutionProvider' in available_providers:
+            self.provider = 'ROCMExecutionProvider'
+            print("✅ Используется AMD GPU (ROCm)")
+        elif 'OpenVINOExecutionProvider' in available_providers:
+            self.provider = 'OpenVINOExecutionProvider'
+            print("✅ Используется Intel OpenVINO")
+        else:
+            self.provider = 'CPUExecutionProvider'
+            print("⚠️ Используется CPU")
+        
+        # Загрузка модели
+        self.session = ort.InferenceSession(onnx_path, providers=[self.provider])
+        
+        # Параметры
+        self.confidence_threshold = confidence_threshold
+        self.nms_threshold = nms_threshold
+        
+        # Получение информации о входах/выходах
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        
+        # Определение размера входа
+        input_shape = self.session.get_inputs()[0].shape
+        self.input_size = (input_shape[2], input_shape[3])  # height, width
+        
+        # Цвета для классов
         self.colors = [
-            (0, 255, 0),    # Зеленый
-            (255, 0, 0),    # Синий
-            (0, 0, 255),    # Красный
-            (255, 255, 0),  # Голубой
-            (255, 0, 255),  # Пурпурный
-            (0, 255, 255)   # Желтый
+            (0, 255, 0), (255, 0, 0), (0, 0, 255),
+            (255, 255, 0), (255, 0, 255), (0, 255, 255)
         ]
-
+        
+        # Классы (если есть)
+        self.class_names = self.load_class_names()
+        
         # FPS счетчик
         self.fps = 0
         self.frame_count = 0
         self.last_time = time.time()
-        self.frame_skip = 0  # Счетчик пропущенных кадров для оптимизации
-
-    def process_frame(self, frame, conf_threshold=0.5, show_boxes=True, show_labels=True):
-        """
-        Обработка одного кадра с распознаванием объектов
-        """
-        # Пропускаем каждый 2-й кадр для увеличения FPS на Linux
-        self.frame_skip += 1
-        if self.frame_skip % 2 == 0:
-            # Быстрая копия без обработки
-            annotated_frame = frame.copy()
-            self.update_fps()
-            self.add_frame_info(annotated_frame, [])
-            return annotated_frame, []
         
-        # Выполнение инференса
-        results = self.model(frame, conf=conf_threshold, device=self.device, verbose=False)
+        print(f"✅ Модель загружена, размер входа: {self.input_size}")
+    
+    def load_class_names(self, classes_path="coco.names"):
+        """Загрузка имен классов"""
+        # Стандартные классы COCO
+        default_classes = [
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
+            'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+            'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
+            'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+            'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+            'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
+            'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+            'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+            'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+            'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+            'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+            'toothbrush'
+        ]
         
-        # Получаем результат для текущего кадра
-        result = results[0]
+        if os.path.exists(classes_path):
+            with open(classes_path, 'r') as f:
+                return [line.strip() for line in f.readlines()]
+        return default_classes
+    
+    def preprocess(self, image):
+        """Предобработка изображения для ONNX"""
+        # Изменение размера
+        resized = cv2.resize(image, self.input_size)
         
-        # Создаем копию кадра для отрисовки
+        # Нормализация
+        input_data = resized.astype(np.float32) / 255.0
+        
+        # Изменение формата (HWC -> CHW)
+        input_data = np.transpose(input_data, (2, 0, 1))
+        
+        # Добавление batch dimension
+        input_data = np.expand_dims(input_data, axis=0)
+        
+        return input_data
+    
+    def postprocess(self, outputs, original_shape):
+        """Постобработка результатов"""
+        detections = []
+        
+        # Обработка в зависимости от формата вывода
+        if len(outputs) == 1:
+            # Формат: [batch, num_detections, 6] (x1,y1,x2,y2,conf,class)
+            output = outputs[0]
+            for detection in output[0]:
+                if len(detection) >= 6:
+                    x1, y1, x2, y2, confidence, class_id = detection[:6]
+                    
+                    if confidence > self.confidence_threshold:
+                        # Масштабирование координат
+                        h, w = original_shape[:2]
+                        x1 = int(x1 * w)
+                        y1 = int(y1 * h)
+                        x2 = int(x2 * w)
+                        y2 = int(y2 * h)
+                        
+                        detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'confidence': float(confidence),
+                            'class_id': int(class_id),
+                            'class_name': self.class_names[int(class_id)] if int(class_id) < len(self.class_names) else f"class_{int(class_id)}"
+                        })
+        
+        return detections
+    
+    def process_frame(self, frame, show_boxes=True, show_labels=True):
+        """Обработка одного кадра"""
+        # Сохраняем оригинальный размер
+        original_shape = frame.shape
+        
+        # Предобработка
+        input_data = self.preprocess(frame)
+        
+        # Инференс
+        outputs = self.session.run(self.output_names, {self.input_name: input_data})
+        
+        # Постобработка
+        detected_objects = self.postprocess(outputs, original_shape)
+        
+        # Рисование результатов
         annotated_frame = frame.copy()
         
-        # Список обнаруженных объектов
-        detected_objects = []
-        
-        # Рисуем результаты
-        if result.boxes is not None and show_boxes:
-            for i, box in enumerate(result.boxes):
-                # Получаем координаты рамки
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                
-                # Получаем класс и уверенность
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                class_name = self.model.names[class_id]
-                
-                # Выбираем цвет для класса
-                color = self.colors[class_id % len(self.colors)]
+        if show_boxes:
+            for obj in detected_objects:
+                x1, y1, x2, y2 = obj['bbox']
+                color = self.colors[obj['class_id'] % len(self.colors)]
                 
                 # Рисуем рамку
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
                 
-                # Подготавливаем метку
                 if show_labels:
-                    label = f"{class_name}: {confidence:.2f}"
-                    # Рисуем фон для текста
-                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                    cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), 
+                    label = f"{obj['class_name']}: {obj['confidence']:.2f}"
+                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                    cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10),
                                 (x1 + label_size[0], y1), color, -1)
-                    # Рисуем текст
-                    cv2.putText(annotated_frame, label, (x1, y1 - 5), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                # Сохраняем информацию об объекте
-                detected_objects.append({
-                    'class_id': class_id,
-                    'class_name': class_name,
-                    'confidence': confidence,
-                    'bbox': [x1, y1, x2, y2],
-                    'center': [(x1 + x2) // 2, (y1 + y2) // 2]
-                })
+                    cv2.putText(annotated_frame, label, (x1, y1 - 5),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
-        # Обновляем FPS
+        # Обновление FPS
         self.update_fps()
-        
-        # Добавляем информацию на кадр
         self.add_frame_info(annotated_frame, detected_objects)
         
         return annotated_frame, detected_objects
     
     def update_fps(self):
-        """Обновление счетчика FPS"""
+        """Обновление FPS"""
         self.frame_count += 1
         current_time = time.time()
         if current_time - self.last_time >= 1.0:
@@ -123,369 +193,143 @@ class DroneYOLORecognizer:
             self.last_time = current_time
     
     def add_frame_info(self, frame, detected_objects):
-        """Добавление информационной панели на кадр"""
-        # Информация о FPS
-        cv2.putText(frame, f"FPS: {self.fps}", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-        # Количество обнаруженных объектов
-        cv2.putText(frame, f"Objects: {len(detected_objects)}", (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-        # Время
-        time_str = datetime.now().strftime("%H:%M:%S")
-        cv2.putText(frame, time_str, (frame.shape[1] - 150, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Список обнаруженных объектов справа
-        if detected_objects:
-            y_offset = 80
-            for i, obj in enumerate(detected_objects[:5]):  # Показываем максимум 5 объектов
-                text = f"{obj['class_name']}: {obj['confidence']:.2f}"
-                cv2.putText(frame, text, (frame.shape[1] - 250, y_offset + i * 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        """Добавление информации на кадр"""
+        cv2.putText(frame, f"FPS: {self.fps}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Objects: {len(detected_objects)}", (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Backend: ONNX-{self.provider.replace('ExecutionProvider', '')}", (10, 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+
+### 2️⃣ **Еще проще - OpenCV DNN (без дополнительных библиотек)**
+
+```python
+class YOLOOpenCVDNNRecognizer:
+    """YOLO распознаватель используя только OpenCV"""
     
-    def get_drone_commands(self, detected_objects, frame_width, frame_height):
+    def __init__(self, weights_path, config_path, classes_path="coco.names"):
         """
-        Генерация команд для дрона на основе распознанных объектов
+        Args:
+            weights_path: путь к .weights файлу (Darknet)
+            config_path: путь к .cfg файлу
+            classes_path: путь к файлу с классами
         """
-        commands = {
-            'follow_object': None,
-            'avoid_object': False,
-            'move_direction': 'center'
-        }
+        # Загрузка сети
+        self.net = cv2.dnn.readNet(weights_path, config_path)
         
-        # Если есть объекты, выбираем самый уверенный в центре
-        if detected_objects:
-            # Находим объект ближайший к центру кадра
-            center_x, center_y = frame_width // 2, frame_height // 2
-            best_object = None
-            min_distance = float('inf')
-            
-            for obj in detected_objects:
-                obj_center = obj['center']
-                distance = ((obj_center[0] - center_x) ** 2 + (obj_center[1] - center_y) ** 2) ** 0.5
-                if distance < min_distance:
-                    min_distance = distance
-                    best_object = obj
-            
-            if best_object:
-                # Определяем направление движения
-                obj_center = best_object['center']
-                if obj_center[0] < center_x - 50:
-                    commands['move_direction'] = 'left'
-                elif obj_center[0] > center_x + 50:
-                    commands['move_direction'] = 'right'
-                else:
-                    commands['move_direction'] = 'center'
-                
-                commands['follow_object'] = best_object
+        # Использование CUDA если доступно
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            print("✅ Используется OpenCV CUDA")
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        else:
+            print("⚠️ Используется CPU")
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         
-        return commands
-
-
-class PioneerDroneController:
-    """Класс для управления дроном в Linux"""
-    
-    def __init__(self, drone_ip="192.168.31.1", camera_ip="192.168.31.1", camera_port=8554):
-        self.drone_ip = drone_ip
-        self.camera_ip = camera_ip
-        self.camera_port = camera_port
-        self.pioneer = None
-        self.camera = None
-        self.connected = False
+        # Загрузка классов
+        self.class_names = []
+        if os.path.exists(classes_path):
+            with open(classes_path, 'r') as f:
+                self.class_names = [line.strip() for line in f.readlines()]
         
-    def connect(self):
-        """Подключение к дрону"""
-        try:
-            print(f"🟢 Подключение к дрону ({self.drone_ip})...")
-            self.pioneer = Pioneer(ip=self.drone_ip)
-            
-            print(f"🎥 Подключение к камере ({self.camera_ip}:{self.camera_port})...")
-            # На Linux может потребоваться GStreamer
-            self.camera = Camera(ip=self.camera_ip, port=self.camera_port)
-            
-            # Проверка подключения
-            telemetry = self.pioneer.get_telemetry()
-            if telemetry:
-                print(f"✅ Дрон подключен!")
-                print(f"   Батарея: {telemetry.get('battery', 'N/A')}%")
-                self.connected = True
-            else:
-                print("⚠️ Дрон подключен, но телеметрия не получена")
-                self.connected = True
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Ошибка подключения: {e}")
-            self.connected = False
-            return False
-    
-    def get_frame(self):
-        """Получение кадра с камеры"""
-        if not self.connected:
-            return None
+        # Параметры
+        self.confidence_threshold = 0.5
+        self.nms_threshold = 0.4
         
-        try:
-            frame = self.camera.get_frame()
-            return frame
-        except Exception as e:
-            print(f"⚠️ Ошибка получения кадра: {e}")
-            return None
+        # Получение выходных слоев
+        self.output_layers = self.net.getUnconnectedOutLayersNames()
+        
+        # Цвета
+        self.colors = np.random.uniform(0, 255, size=(len(self.class_names), 3))
+        
+        # FPS счетчик
+        self.fps = 0
+        self.frame_count = 0
+        self.last_time = time.time()
     
-    def takeoff(self, height=1.0):
-        """Взлет"""
-        if self.connected:
-            self.pioneer.arm()
-            time.sleep(0.5)
-            self.pioneer.takeoff(height=height)
-            print(f"🚁 Взлет на {height}м")
-    
-    def land(self):
-        """Посадка"""
-        if self.connected:
-            self.pioneer.land()
-            print("🚁 Посадка")
-    
-    def stop(self):
-        """Остановка движения"""
-        if self.connected:
-            self.pioneer.move_xyz(velocity_x=0, velocity_y=0, velocity_z=0, yaw_rate=0)
-            print("⏹️ Стоп")
-    
-    def move(self, vx=0, vy=0, vz=0, yaw=0):
-        """Движение дрона"""
-        if self.connected:
-            self.pioneer.move_xyz(velocity_x=vx, velocity_y=vy, velocity_z=vz, yaw_rate=yaw)
-    
-    def disconnect(self):
-        """Отключение от дрона"""
-        if self.connected:
-            self.pioneer.disarm()
-            self.connected = False
-            print("🔌 Отключено от дрона")
-
-
-def signal_handler(sig, frame):
-    """Обработчик сигнала для корректного завершения"""
-    print("\n🟡 Получен сигнал завершения...")
-    sys.exit(0)
-
-
-def main():
-    """Основная функция для запуска распознавания с дрона"""
-    
-    # Параметры (настройте под ваш дрон)
-    WEIGHTS_PATH = "runs/detect/train-12/weights/best.pt"  # Путь к весам
-    DRONE_IP = "192.168.31.1"  # IP дрона (обычно 192.168.31.1)
-    CAMERA_IP = "192.168.31.1"  # IP камеры (обычно тот же, что у дрона)
-    CAMERA_PORT = 8554  # Порт видеопотока
-    CONFIDENCE_THRESHOLD = 0.5  # Порог уверенности
-    SHOW_VIDEO = True  # Показывать видео
-    SAVE_VIDEO = False  # Сохранять видео
-    
-    # Регистрация обработчика сигнала
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    # Инициализация контроллера дрона
-    drone_controller = PioneerDroneController(
-        drone_ip=DRONE_IP,
-        camera_ip=CAMERA_IP,
-        camera_port=CAMERA_PORT
-    )
-    
-    # Подключение к дрону
-    if not drone_controller.connect():
-        print("❌ Не удалось подключиться к дрону")
-        print("\nПроверьте:")
-        print("  1. Дрон включен")
-        print("  2. Компьютер подключен к Wi-Fi дрона")
-        print("  3. IP адрес дрона правильный")
-        print("  4. Брандмауэр не блокирует соединение")
-        return
-    
-    # Инициализация распознавателя
-    try:
-        print("🟢 Загрузка модели YOLO...")
-        recognizer = DroneYOLORecognizer(weights_path=WEIGHTS_PATH)
-    except FileNotFoundError as e:
-        print(f"❌ {e}")
-        print("Укажите правильный путь к файлу весов")
-        return
-    
-    # Для сохранения видео
-    video_writer = None
-    if SAVE_VIDEO:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        video_path = f"drone_recording_{timestamp}.mp4"
-    
-    print("\n🚁 Дрон готов к работе!")
-    print("Управление:")
-    print("  'q'   - выход")
-    print("  't'   - взлет")
-    print("  'l'   - посадка")
-    print("  's'   - стоп")
-    print("  'r'   - начать/остановить запись видео")
-    print("  'w'   - вперед")
-    print("  'a'   - влево")
-    print("  'd'   - вправо")
-    print("  'up'  - вверх")
-    print("  'down'- вниз")
-    print("\n")
-    
-    # Основной цикл
-    recording = False
-    running = True
-    frame_count = 0
-    
-    try:
-        while running:
-            # Получение кадра с камеры дрона
-            frame = drone_controller.get_frame()
-            
-            if frame is None:
-                print("\r⚠️ Нет кадра от камеры", end="")
-                time.sleep(0.1)
-                continue
-            
-            # Распознавание объектов на кадре (каждый 2-й кадр для оптимизации)
-            processed_frame, detected_objects = recognizer.process_frame(
-                frame, 
-                conf_threshold=CONFIDENCE_THRESHOLD,
-                show_boxes=True,
-                show_labels=True
-            )
-            
-            # Вывод информации о найденных объектах
-            if detected_objects:
-                print(f"\r📊 Объектов: {len(detected_objects)} | FPS: {recognizer.fps}", end="")
+    def process_frame(self, frame):
+        """Обработка кадра"""
+        height, width = frame.shape[:2]
+        
+        # Создание блоба
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+        
+        # Инференс
+        self.net.setInput(blob)
+        outputs = self.net.forward(self.output_layers)
+        
+        # Постобработка
+        boxes, confidences, class_ids = [], [], []
+        
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
                 
-                # Логика следования за объектом
-                commands = recognizer.get_drone_commands(
-                    detected_objects, 
-                    processed_frame.shape[1], 
-                    processed_frame.shape[0]
-                )
+                if confidence > self.confidence_threshold:
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+        
+        # NMS
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, self.confidence_threshold, self.nms_threshold)
+        
+        # Рисование результатов
+        detected_objects = []
+        if len(indexes) > 0:
+            for i in indexes.flatten():
+                x, y, w, h = boxes[i]
+                color = self.colors[class_ids[i]]
                 
-                # Управление дроном на основе обнаруженного объекта
-                if commands['follow_object']:
-                    obj = commands['follow_object']
-                    if commands['move_direction'] == 'left':
-                        drone_controller.move(vx=-0.3, vy=0, vz=0, yaw=0)
-                    elif commands['move_direction'] == 'right':
-                        drone_controller.move(vx=0.3, vy=0, vz=0, yaw=0)
-                    else:
-                        drone_controller.stop()
-            
-            # Сохранение видео
-            if SAVE_VIDEO and recording:
-                if video_writer is None:
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    video_writer = cv2.VideoWriter(
-                        video_path, fourcc, 20.0, 
-                        (processed_frame.shape[1], processed_frame.shape[0])
-                    )
-                video_writer.write(processed_frame)
-            
-            # Показ видео
-            if SHOW_VIDEO:
-                cv2.imshow('Drone YOLO Recognition', processed_frame)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                label = f"{self.class_names[class_ids[i]]}: {confidences[i]:.2f}"
+                cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
-                # Обработка клавиш управления
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('q'):
-                    print("\n🟡 Завершение работы...")
-                    running = False
-                elif key == ord('t'):
-                    drone_controller.takeoff()
-                elif key == ord('l'):
-                    drone_controller.land()
-                elif key == ord('s'):
-                    drone_controller.stop()
-                elif key == ord('r'):
-                    recording = not recording
-                    status = "начата" if recording else "остановлена"
-                    print(f"\n📹 Запись видео {status}")
-                    if not recording and video_writer:
-                        video_writer.release()
-                        video_writer = None
-                        print(f"✅ Видео сохранено: {video_path}")
-                elif key == ord('w'):
-                    drone_controller.move(vx=0.5, vy=0, vz=0, yaw=0)
-                elif key == ord('a'):
-                    drone_controller.move(vx=0, vy=-0.5, vz=0, yaw=0)
-                elif key == ord('d'):
-                    drone_controller.move(vx=0, vy=0.5, vz=0, yaw=0)
-                elif key == ord('w'):
-                    drone_controller.move(vx=0, vy=0, vz=0.3, yaw=0)
-                elif key == ord('s'):
-                    drone_controller.move(vx=0, vy=0, vz=-0.3, yaw=0)
+                detected_objects.append({
+                    'class_name': self.class_names[class_ids[i]],
+                    'confidence': confidences[i],
+                    'bbox': [x, y, x + w, y + h]
+                })
+        
+        # Обновление FPS
+        self.update_fps()
+        cv2.putText(frame, f"FPS: {self.fps}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        return frame, detected_objects
     
-    except KeyboardInterrupt:
-        print("\n🟡 Прерывание пользователем")
-    
-    except Exception as e:
-        print(f"\n🔴 Ошибка: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    finally:
-        # Очистка ресурсов
-        print("🟢 Очистка ресурсов...")
-        drone_controller.land()
-        time.sleep(2)
-        drone_controller.disconnect()
-        if SAVE_VIDEO and video_writer:
-            video_writer.release()
-        cv2.destroyAllWindows()
-        print("✅ Программа завершена")
+    def update_fps(self):
+        self.frame_count += 1
+        if time.time() - self.last_time >= 1.0:
+            self.fps = self.frame_count
+            self.frame_count = 0
+            self.last_time = time.time()
 
 
-def test_without_drone():
-    """Тестовая функция без дрона (для отладки)"""
-    WEIGHTS_PATH = "runs/detect/train-12/weights/best.pt"
-    TEST_IMAGE = "test_image.jpg"
-    
-    print("🧪 Тестовый режим (без дрона)")
-    
-    if not os.path.exists(WEIGHTS_PATH):
-        print(f"❌ Файл весов не найден: {WEIGHTS_PATH}")
-        return
-    
-    recognizer = DroneYOLORecognizer(weights_path=WEIGHTS_PATH)
-    
-    # Если есть тестовое изображение
-    if os.path.exists(TEST_IMAGE):
-        frame = cv2.imread(TEST_IMAGE)
-        if frame is not None:
-            processed_frame, objects = recognizer.process_frame(frame)
-            print(f"\nНайдено объектов: {len(objects)}")
-            for obj in objects:
-                print(f"  - {obj['class_name']}: {obj['confidence']:.2f}")
-            
-            cv2.imshow('Test', processed_frame)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-    else:
-        # Тест с веб-камерой
-        print("Тест с веб-камерой...")
-        cap = cv2.VideoCapture(0)
-        while True:
-            ret, frame = cap.read()
-            if ret:
-                processed_frame, objects = recognizer.process_frame(frame)
-                cv2.imshow('Test Webcam', processed_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-        cap.release()
-        cv2.destroyAllWindows()
+### 3️⃣ **Конвертация PyTorch весов в ONNX**
 
+Если у вас уже есть .pt файл, конвертируйте его:
 
-if __name__ == "__main__":
-    # Проверка аргументов командной строки
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        test_without_drone()
-    else:
-        main()
+```python
+# convert_to_onnx.py
+import torch
+from ultralytics import YOLO
+
+# Загрузка модели
+model = YOLO("runs/detect/train-12/weights/best.pt")
+
+# Экспорт в ONNX
+model.export(format="onnx", imgsz=640, half=False)
+
+print("✅ Модель конвертирована в ONNX")
