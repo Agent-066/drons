@@ -1,3 +1,568 @@
-pip3 install torch ultralytics opencv-python sympy
+Вот адаптированная версия для Linux с учетом особенностей Pioneer SDK и видеопотока:
+
+python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from ultralytics import YOLO
+import cv2
+import torch
+import numpy as np
+from pioneer_sdk import Pioneer, Camera
+import time
+from datetime import datetime
+import signal
+import sys
+import os
+
+class DroneYOLORecognizer:
+    def __init__(self, weights_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        """
+        Инициализация распознавателя для дрона
+        """
+        # Загрузка модели YOLO
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Файл весов не найден: {weights_path}")
+        
+        self.model = YOLO(weights_path)
+        self.device = device
+        self.model.to(device)
+        print(f"✅ Модель YOLO загружена на устройство: {self.device}")
+
+        # Цвета для разных классов (BGR формат для OpenCV)
+        self.colors = [
+            (0, 255, 0),    # Зеленый
+            (255, 0, 0),    # Синий
+            (0, 0, 255),    # Красный
+            (255, 255, 0),  # Голубой
+            (255, 0, 255),  # Пурпурный
+            (0, 255, 255)   # Желтый
+        ]
+
+        # FPS счетчик
+        self.fps = 0
+        self.frame_count = 0
+        self.last_time = time.time()
+        self.frame_skip = 0  # Счетчик пропущенных кадров для оптимизации
+
+    def process_frame(self, frame, conf_threshold=0.5, show_boxes=True, show_labels=True):
+        """
+        Обработка одного кадра с распознаванием объектов
+        """
+        # Пропускаем каждый 2-й кадр для увеличения FPS на Linux
+        self.frame_skip += 1
+        if self.frame_skip % 2 == 0:
+            # Быстрая копия без обработки
+            annotated_frame = frame.copy()
+            self.update_fps()
+            self.add_frame_info(annotated_frame, [])
+            return annotated_frame, []
+        
+        # Выполнение инференса
+        results = self.model(frame, conf=conf_threshold, device=self.device, verbose=False)
+        
+        # Получаем результат для текущего кадра
+        result = results[0]
+        
+        # Создаем копию кадра для отрисовки
+        annotated_frame = frame.copy()
+        
+        # Список обнаруженных объектов
+        detected_objects = []
+        
+        # Рисуем результаты
+        if result.boxes is not None and show_boxes:
+            for i, box in enumerate(result.boxes):
+                # Получаем координаты рамки
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                
+                # Получаем класс и уверенность
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+                class_name = self.model.names[class_id]
+                
+                # Выбираем цвет для класса
+                color = self.colors[class_id % len(self.colors)]
+                
+                # Рисуем рамку
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Подготавливаем метку
+                if show_labels:
+                    label = f"{class_name}: {confidence:.2f}"
+                    # Рисуем фон для текста
+                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                    cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), 
+                                (x1 + label_size[0], y1), color, -1)
+                    # Рисуем текст
+                    cv2.putText(annotated_frame, label, (x1, y1 - 5), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Сохраняем информацию об объекте
+                detected_objects.append({
+                    'class_id': class_id,
+                    'class_name': class_name,
+                    'confidence': confidence,
+                    'bbox': [x1, y1, x2, y2],
+                    'center': [(x1 + x2) // 2, (y1 + y2) // 2]
+                })
+        
+        # Обновляем FPS
+        self.update_fps()
+        
+        # Добавляем информацию на кадр
+        self.add_frame_info(annotated_frame, detected_objects)
+        
+        return annotated_frame, detected_objects
+    
+    def update_fps(self):
+        """Обновление счетчика FPS"""
+        self.frame_count += 1
+        current_time = time.time()
+        if current_time - self.last_time >= 1.0:
+            self.fps = self.frame_count
+            self.frame_count = 0
+            self.last_time = current_time
+    
+    def add_frame_info(self, frame, detected_objects):
+        """Добавление информационной панели на кадр"""
+        # Информация о FPS
+        cv2.putText(frame, f"FPS: {self.fps}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Количество обнаруженных объектов
+        cv2.putText(frame, f"Objects: {len(detected_objects)}", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Время
+        time_str = datetime.now().strftime("%H:%M:%S")
+        cv2.putText(frame, time_str, (frame.shape[1] - 150, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Список обнаруженных объектов справа
+        if detected_objects:
+            y_offset = 80
+            for i, obj in enumerate(detected_objects[:5]):  # Показываем максимум 5 объектов
+                text = f"{obj['class_name']}: {obj['confidence']:.2f}"
+                cv2.putText(frame, text, (frame.shape[1] - 250, y_offset + i * 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    
+    def get_drone_commands(self, detected_objects, frame_width, frame_height):
+        """
+        Генерация команд для дрона на основе распознанных объектов
+        """
+        commands = {
+            'follow_object': None,
+            'avoid_object': False,
+            'move_direction': 'center'
+        }
+        
+        # Если есть объекты, выбираем самый уверенный в центре
+        if detected_objects:
+            # Находим объект ближайший к центру кадра
+            center_x, center_y = frame_width // 2, frame_height // 2
+            best_object = None
+            min_distance = float('inf')
+            
+            for obj in detected_objects:
+                obj_center = obj['center']
+                distance = ((obj_center[0] - center_x) ** 2 + (obj_center[1] - center_y) ** 2) ** 0.5
+                if distance < min_distance:
+                    min_distance = distance
+                    best_object = obj
+            
+            if best_object:
+                # Определяем направление движения
+                obj_center = best_object['center']
+                if obj_center[0] < center_x - 50:
+                    commands['move_direction'] = 'left'
+                elif obj_center[0] > center_x + 50:
+                    commands['move_direction'] = 'right'
+                else:
+                    commands['move_direction'] = 'center'
+                
+                commands['follow_object'] = best_object
+        
+        return commands
 
 
+class PioneerDroneController:
+    """Класс для управления дроном в Linux"""
+    
+    def __init__(self, drone_ip="192.168.31.1", camera_ip="192.168.31.1", camera_port=8554):
+        self.drone_ip = drone_ip
+        self.camera_ip = camera_ip
+        self.camera_port = camera_port
+        self.pioneer = None
+        self.camera = None
+        self.connected = False
+        
+    def connect(self):
+        """Подключение к дрону"""
+        try:
+            print(f"🟢 Подключение к дрону ({self.drone_ip})...")
+            self.pioneer = Pioneer(ip=self.drone_ip)
+            
+            print(f"🎥 Подключение к камере ({self.camera_ip}:{self.camera_port})...")
+            # На Linux может потребоваться GStreamer
+            self.camera = Camera(ip=self.camera_ip, port=self.camera_port)
+            
+            # Проверка подключения
+            telemetry = self.pioneer.get_telemetry()
+            if telemetry:
+                print(f"✅ Дрон подключен!")
+                print(f"   Батарея: {telemetry.get('battery', 'N/A')}%")
+                self.connected = True
+            else:
+                print("⚠️ Дрон подключен, но телеметрия не получена")
+                self.connected = True
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Ошибка подключения: {e}")
+            self.connected = False
+            return False
+    
+    def get_frame(self):
+        """Получение кадра с камеры"""
+        if not self.connected:
+            return None
+        
+        try:
+            frame = self.camera.get_frame()
+            return frame
+        except Exception as e:
+            print(f"⚠️ Ошибка получения кадра: {e}")
+            return None
+    
+    def takeoff(self, height=1.0):
+        """Взлет"""
+        if self.connected:
+            self.pioneer.arm()
+            time.sleep(0.5)
+            self.pioneer.takeoff(height=height)
+            print(f"🚁 Взлет на {height}м")
+    
+    def land(self):
+        """Посадка"""
+        if self.connected:
+            self.pioneer.land()
+            print("🚁 Посадка")
+    
+    def stop(self):
+        """Остановка движения"""
+        if self.connected:
+            self.pioneer.move_xyz(velocity_x=0, velocity_y=0, velocity_z=0, yaw_rate=0)
+            print("⏹️ Стоп")
+    
+    def move(self, vx=0, vy=0, vz=0, yaw=0):
+        """Движение дрона"""
+        if self.connected:
+            self.pioneer.move_xyz(velocity_x=vx, velocity_y=vy, velocity_z=vz, yaw_rate=yaw)
+    
+    def disconnect(self):
+        """Отключение от дрона"""
+        if self.connected:
+            self.pioneer.disarm()
+            self.connected = False
+            print("🔌 Отключено от дрона")
+
+
+def signal_handler(sig, frame):
+    """Обработчик сигнала для корректного завершения"""
+    print("\n🟡 Получен сигнал завершения...")
+    sys.exit(0)
+
+
+def main():
+    """Основная функция для запуска распознавания с дрона"""
+    
+    # Параметры (настройте под ваш дрон)
+    WEIGHTS_PATH = "runs/detect/train-12/weights/best.pt"  # Путь к весам
+    DRONE_IP = "192.168.31.1"  # IP дрона (обычно 192.168.31.1)
+    CAMERA_IP = "192.168.31.1"  # IP камеры (обычно тот же, что у дрона)
+    CAMERA_PORT = 8554  # Порт видеопотока
+    CONFIDENCE_THRESHOLD = 0.5  # Порог уверенности
+    SHOW_VIDEO = True  # Показывать видео
+    SAVE_VIDEO = False  # Сохранять видео
+    
+    # Регистрация обработчика сигнала
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Инициализация контроллера дрона
+    drone_controller = PioneerDroneController(
+        drone_ip=DRONE_IP,
+        camera_ip=CAMERA_IP,
+        camera_port=CAMERA_PORT
+    )
+    
+    # Подключение к дрону
+    if not drone_controller.connect():
+        print("❌ Не удалось подключиться к дрону")
+        print("\nПроверьте:")
+        print("  1. Дрон включен")
+        print("  2. Компьютер подключен к Wi-Fi дрона")
+        print("  3. IP адрес дрона правильный")
+        print("  4. Брандмауэр не блокирует соединение")
+        return
+    
+    # Инициализация распознавателя
+    try:
+        print("🟢 Загрузка модели YOLO...")
+        recognizer = DroneYOLORecognizer(weights_path=WEIGHTS_PATH)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        print("Укажите правильный путь к файлу весов")
+        return
+    
+    # Для сохранения видео
+    video_writer = None
+    if SAVE_VIDEO:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path = f"drone_recording_{timestamp}.mp4"
+    
+    print("\n🚁 Дрон готов к работе!")
+    print("Управление:")
+    print("  'q'   - выход")
+    print("  't'   - взлет")
+    print("  'l'   - посадка")
+    print("  's'   - стоп")
+    print("  'r'   - начать/остановить запись видео")
+    print("  'w'   - вперед")
+    print("  'a'   - влево")
+    print("  'd'   - вправо")
+    print("  'up'  - вверх")
+    print("  'down'- вниз")
+    print("\n")
+    
+    # Основной цикл
+    recording = False
+    running = True
+    frame_count = 0
+    
+    try:
+        while running:
+            # Получение кадра с камеры дрона
+            frame = drone_controller.get_frame()
+            
+            if frame is None:
+                print("\r⚠️ Нет кадра от камеры", end="")
+                time.sleep(0.1)
+                continue
+            
+            # Распознавание объектов на кадре (каждый 2-й кадр для оптимизации)
+            processed_frame, detected_objects = recognizer.process_frame(
+                frame, 
+                conf_threshold=CONFIDENCE_THRESHOLD,
+                show_boxes=True,
+                show_labels=True
+            )
+            
+            # Вывод информации о найденных объектах
+            if detected_objects:
+                print(f"\r📊 Объектов: {len(detected_objects)} | FPS: {recognizer.fps}", end="")
+                
+                # Логика следования за объектом
+                commands = recognizer.get_drone_commands(
+                    detected_objects, 
+                    processed_frame.shape[1], 
+                    processed_frame.shape[0]
+                )
+                
+                # Управление дроном на основе обнаруженного объекта
+                if commands['follow_object']:
+                    obj = commands['follow_object']
+                    if commands['move_direction'] == 'left':
+                        drone_controller.move(vx=-0.3, vy=0, vz=0, yaw=0)
+                    elif commands['move_direction'] == 'right':
+                        drone_controller.move(vx=0.3, vy=0, vz=0, yaw=0)
+                    else:
+                        drone_controller.stop()
+            
+            # Сохранение видео
+            if SAVE_VIDEO and recording:
+                if video_writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    video_writer = cv2.VideoWriter(
+                        video_path, fourcc, 20.0, 
+                        (processed_frame.shape[1], processed_frame.shape[0])
+                    )
+                video_writer.write(processed_frame)
+            
+            # Показ видео
+            if SHOW_VIDEO:
+                cv2.imshow('Drone YOLO Recognition', processed_frame)
+                
+                # Обработка клавиш управления
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord('q'):
+                    print("\n🟡 Завершение работы...")
+                    running = False
+                elif key == ord('t'):
+                    drone_controller.takeoff()
+                elif key == ord('l'):
+                    drone_controller.land()
+                elif key == ord('s'):
+                    drone_controller.stop()
+                elif key == ord('r'):
+                    recording = not recording
+                    status = "начата" if recording else "остановлена"
+                    print(f"\n📹 Запись видео {status}")
+                    if not recording and video_writer:
+                        video_writer.release()
+                        video_writer = None
+                        print(f"✅ Видео сохранено: {video_path}")
+                elif key == ord('w'):
+                    drone_controller.move(vx=0.5, vy=0, vz=0, yaw=0)
+                elif key == ord('a'):
+                    drone_controller.move(vx=0, vy=-0.5, vz=0, yaw=0)
+                elif key == ord('d'):
+                    drone_controller.move(vx=0, vy=0.5, vz=0, yaw=0)
+                elif key == ord('w'):
+                    drone_controller.move(vx=0, vy=0, vz=0.3, yaw=0)
+                elif key == ord('s'):
+                    drone_controller.move(vx=0, vy=0, vz=-0.3, yaw=0)
+    
+    except KeyboardInterrupt:
+        print("\n🟡 Прерывание пользователем")
+    
+    except Exception as e:
+        print(f"\n🔴 Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Очистка ресурсов
+        print("🟢 Очистка ресурсов...")
+        drone_controller.land()
+        time.sleep(2)
+        drone_controller.disconnect()
+        if SAVE_VIDEO and video_writer:
+            video_writer.release()
+        cv2.destroyAllWindows()
+        print("✅ Программа завершена")
+
+
+def test_without_drone():
+    """Тестовая функция без дрона (для отладки)"""
+    WEIGHTS_PATH = "runs/detect/train-12/weights/best.pt"
+    TEST_IMAGE = "test_image.jpg"
+    
+    print("🧪 Тестовый режим (без дрона)")
+    
+    if not os.path.exists(WEIGHTS_PATH):
+        print(f"❌ Файл весов не найден: {WEIGHTS_PATH}")
+        return
+    
+    recognizer = DroneYOLORecognizer(weights_path=WEIGHTS_PATH)
+    
+    # Если есть тестовое изображение
+    if os.path.exists(TEST_IMAGE):
+        frame = cv2.imread(TEST_IMAGE)
+        if frame is not None:
+            processed_frame, objects = recognizer.process_frame(frame)
+            print(f"\nНайдено объектов: {len(objects)}")
+            for obj in objects:
+                print(f"  - {obj['class_name']}: {obj['confidence']:.2f}")
+            
+            cv2.imshow('Test', processed_frame)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+    else:
+        # Тест с веб-камерой
+        print("Тест с веб-камерой...")
+        cap = cv2.VideoCapture(0)
+        while True:
+            ret, frame = cap.read()
+            if ret:
+                processed_frame, objects = recognizer.process_frame(frame)
+                cv2.imshow('Test Webcam', processed_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    # Проверка аргументов командной строки
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_without_drone()
+    else:
+        main()
+📋 Инструкция по запуску на Linux
+1. Установка зависимостей
+bash
+# Установка системных зависимостей
+sudo apt update
+sudo apt install -y python3-pip python3-opencv
+
+# Установка Python библиотек
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip3 install ultralytics opencv-python numpy
+pip3 install pioneer-sdk  # Если не работает, установите из исходников
+2. Настройка сети
+bash
+# Подключение к Wi-Fi дрона
+nmcli device wifi list  # Найти сеть дрона
+nmcli device wifi connect "Pioneer_XXXXXX" password "12345678"
+
+# Проверка подключения
+ping 192.168.31.1
+3. Запуск программы
+bash
+# Сделать файл исполняемым
+chmod +x drone_recognition.py
+
+# Запуск с дроном
+python3 drone_recognition.py
+
+# Тестовый режим (без дрона)
+python3 drone_recognition.py --test
+4. Устранение проблем с камерой на Linux
+Если камера не работает, используйте альтернативный код для получения видео:
+
+python
+# Альтернативный метод получения видео через OpenCV
+def get_camera_alternative():
+    # RTSP поток
+    cap = cv2.VideoCapture("rtsp://192.168.31.1:8554/live")
+    
+    # Или через GStreamer
+    # cap = cv2.VideoCapture("rtspsrc location=rtsp://192.168.31.1:8554/live ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink", cv2.CAP_GSTREAMER)
+    
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            yield frame
+        else:
+            break
+5. Автоматический скрипт запуска
+Создайте run_drone.sh:
+
+bash
+#!/bin/bash
+# Скрипт для запуска распознавания на дроне
+
+echo "🚁 Запуск системы распознавания на дроне"
+
+# Проверка сети
+if ping -c 1 192.168.31.1 &> /dev/null; then
+    echo "✅ Дрон доступен"
+else
+    echo "❌ Дрон не найден! Подключитесь к Wi-Fi дрона"
+    exit 1
+fi
+
+# Активация виртуального окружения (если используется)
+# source venv/bin/activate
+
+# Запуск программы
+python3 drone_recognition.py
+
+echo "✅ Программа завершена"
+bash
+chmod +x run_drone.sh
+./run_drone.sh
